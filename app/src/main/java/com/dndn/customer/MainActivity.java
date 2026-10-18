@@ -4,6 +4,9 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.*;
+import android.net.nsd.NsdManager;
+import android.net.nsd.NsdServiceInfo;
+import android.net.wifi.WifiManager;
 import android.os.*;
 import android.text.InputType;
 import android.view.*;
@@ -14,7 +17,7 @@ import java.util.*;
 import java.util.concurrent.*;
 
 public class MainActivity extends Activity {
-    static final int PORT = 8080;
+    static final int PORT = 8080, UDP_PORT = 45454;
     LinearLayout box;
     TextView status;
     EditText ipIn;
@@ -22,7 +25,12 @@ public class MainActivity extends Activity {
     WebView wv;
     ValueCallback<Uri[]> fileCb;
     SharedPreferences sp;
-    volatile boolean scanning, started;
+    volatile boolean scanning, started, listening;
+    volatile String foundIp;
+    NsdManager nsd;
+    NsdManager.DiscoveryListener dl;
+    WifiManager.MulticastLock mlock;
+    java.net.DatagramSocket udp;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -75,7 +83,7 @@ public class MainActivity extends Activity {
         bindWifi();
     }
 
-    /** يجبر التطبيق على استعمال الواي فاي حتى لو بدون إنترنت (وإلا قد يستعمل بيانات الهاتف) */
+    /** يجبر التطبيق على استعمال الواي فاي حتى لو بدون إنترنت */
     void bindWifi() {
         try {
             final ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
@@ -92,6 +100,69 @@ public class MainActivity extends Activity {
         new Handler(Looper.getMainLooper()).postDelayed(() -> { if (!started) { started = true; find(); } }, 3000);
     }
 
+    // ---------- الاكتشاف التلقائي ----------
+    void startListeners() {
+        foundIp = null;
+        listening = true;
+        try {
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+            mlock = wm.createMulticastLock("dndn");
+            mlock.setReferenceCounted(false);
+            mlock.acquire();
+        } catch (Exception e) { }
+        // 1) NSD / mDNS
+        try {
+            nsd = (NsdManager) getSystemService(NSD_SERVICE);
+            dl = new NsdManager.DiscoveryListener() {
+                public void onStartDiscoveryFailed(String t, int e) { }
+                public void onStopDiscoveryFailed(String t, int e) { }
+                public void onDiscoveryStarted(String t) { }
+                public void onDiscoveryStopped(String t) { }
+                public void onServiceLost(NsdServiceInfo i) { }
+                public void onServiceFound(NsdServiceInfo i) {
+                    try {
+                        nsd.resolveService(i, new NsdManager.ResolveListener() {
+                            public void onResolveFailed(NsdServiceInfo s, int e) { }
+                            public void onServiceResolved(NsdServiceInfo s) {
+                                if (s.getHost() != null) accept(s.getHost().getHostAddress());
+                            }
+                        });
+                    } catch (Exception e) { }
+                }
+            };
+            nsd.discoverServices("_dndn._tcp.", NsdManager.PROTOCOL_DNS_SD, dl);
+        } catch (Exception e) { }
+        // 2) بث UDP
+        new Thread(() -> {
+            java.net.DatagramSocket ds = null;
+            try {
+                ds = new java.net.DatagramSocket(null);
+                ds.setReuseAddress(true);
+                ds.bind(new java.net.InetSocketAddress(UDP_PORT));
+                ds.setSoTimeout(500);
+                byte[] buf = new byte[256];
+                while (listening) {
+                    try {
+                        java.net.DatagramPacket p = new java.net.DatagramPacket(buf, buf.length);
+                        ds.receive(p);
+                        String s = new String(p.getData(), 0, p.getLength(), "UTF-8");
+                        if (s.startsWith("DNDN|")) accept(p.getAddress().getHostAddress());
+                    } catch (java.net.SocketTimeoutException e) { }
+                }
+            } catch (Exception e) {
+            } finally { try { if (ds != null) ds.close(); } catch (Exception e) { } }
+        }).start();
+    }
+
+    void accept(String ip) { if (foundIp == null && probe(ip)) foundIp = ip; }
+
+    void stopListeners() {
+        listening = false;
+        try { if (nsd != null && dl != null) nsd.stopServiceDiscovery(dl); } catch (Exception e) { }
+        dl = null;
+        try { if (mlock != null && mlock.isHeld()) mlock.release(); } catch (Exception e) { }
+    }
+
     void find() {
         if (scanning || wv.getVisibility() == View.VISIBLE) return;
         scanning = true;
@@ -99,11 +170,21 @@ public class MainActivity extends Activity {
         final String manual = ipIn.getText().toString().trim();
         new Thread(() -> {
             ui("جاري البحث عن البائع...");
-            final String ip = scan(manual);
+            startListeners();
+            String ip = direct(manual);
+            long t0 = System.currentTimeMillis();
+            while (ip == null && System.currentTimeMillis() - t0 < 5000) {
+                ip = foundIp;
+                try { Thread.sleep(150); } catch (Exception e) { }
+            }
+            if (ip == null) ip = scanPrefixes();
+            if (ip == null) ip = foundIp;
+            stopListeners();
+            final String r = ip;
             runOnUiThread(() -> {
                 scanning = false;
                 btn.setEnabled(true);
-                if (ip != null) connect(ip);
+                if (r != null) connect(r);
                 else {
                     status.setText("لم أجد البائع. تأكد أنك متصل بواي فاي البائع وأن تطبيق dndn شغّال عنده، أو اكتب عنوانه يدويًا.");
                     new Handler(Looper.getMainLooper()).postDelayed(this::find, 4000);
@@ -112,16 +193,23 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    String scan(String manual) {
-        List<String> direct = new ArrayList<>();
-        if (!manual.isEmpty()) direct.add(manual);
+    /** العنوان المكتوب يدويًا ثم آخر عنوان محفوظ: اتصال فوري */
+    String direct(String manual) {
+        List<String> l = new ArrayList<>();
+        if (!manual.isEmpty()) l.add(manual);
         String sv = sp.getString("ip", "");
-        if (!sv.isEmpty() && !direct.contains(sv)) direct.add(sv);
-        for (String ip : direct) if (probe(ip)) return ip;
+        if (!sv.isEmpty() && !l.contains(sv)) l.add(sv);
+        for (String ip : l) if (probe(ip)) return ip;
+        return null;
+    }
+
+    /** الخطة الأخيرة: فحص الشبكات الشائعة */
+    String scanPrefixes() {
         LinkedHashSet<String> prefixes = new LinkedHashSet<>(ownPrefixes());
         prefixes.addAll(Arrays.asList("192.168.0.", "192.168.1.", "192.168.43.", "192.168.2.",
                 "192.168.100.", "10.0.0.", "10.0.1.", "172.20.10."));
         for (String pre : prefixes) {
+            if (foundIp != null) return foundIp;
             ui("جاري البحث في " + pre + "x ...");
             ExecutorService ex = Executors.newFixedThreadPool(64);
             List<Future<String>> fs = new ArrayList<>();
